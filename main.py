@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
-
+import time
+import os
 
 # Images URLs
 
@@ -13,38 +14,67 @@ import numpy as np
 # Soldier 01317
 # https://www.loc.gov/pictures/collection/prok/item/2018681235/
 
-def alinear_canales(canal_a_mover, canal_base, margen_busqueda=15):
+def alinear_canales_avanzado(canal_a_mover, canal_base, metodo='ncc', margen_busqueda=15):
     """
-    Busca el mejor desplazamiento (dx, dy) para alinear 'canal_a_mover'
-    con 'canal_base' minimizando la diferencia entre los píxeles.
+    Busca el mejor desplazamiento (dx, dy) utilizando uno de los 4 métodos de correlación.
     """
-    mejor_desplazamiento = (0, 0)
-    min_diferencia = float('inf')
-
-    # Recortamos los bordes (15%)
+    # Recortamos los bordes (15%) para evitar que los marcos negros afecten la correlación
     alto, ancho = canal_base.shape
     c_alto, c_ancho = int(alto * 0.15), int(ancho * 0.15)
+    
+    base_crop = canal_base[c_alto:-c_alto, c_ancho:-c_ancho].astype(np.float32)
+    mover_crop = canal_a_mover[c_alto:-c_alto, c_ancho:-c_ancho].astype(np.float32)
 
-    canal_base_recortado = canal_base[c_alto:-c_alto, c_ancho:-c_ancho]
+    mejor_desplazamiento = (0, 0)
 
-    # Probamos todas las combinaciones posibles de movimiento dentro del margen
-    for dy in range(-margen_busqueda, margen_busqueda + 1):
-        for dx in range(-margen_busqueda, margen_busqueda + 1):
+    if metodo in ['espacial', 'ncc']:
+        # Extraemos una plantilla más pequeña del centro del canal a mover
+        template = mover_crop[margen_busqueda:-margen_busqueda, margen_busqueda:-margen_busqueda]
+        
+        if metodo == 'espacial':
+            # Correlación basada en convolución pura en el espacio (TM_CCORR)
+            resultado = cv2.matchTemplate(base_crop, template, cv2.TM_CCORR)
+        else:
+            # Correlación Normalizada (TM_CCORR_NORMED)
+            resultado = cv2.matchTemplate(base_crop, template, cv2.TM_CCORR_NORMED)
+            
+        _, _, _, max_loc = cv2.minMaxLoc(resultado)
+        # Ajustamos el resultado restando el margen para permitir valores negativos
+        dx = max_loc[0] - margen_busqueda
+        dy = max_loc[1] - margen_busqueda
+        mejor_desplazamiento = (dx, dy)
 
-            # Desplazamos la imagen
-            canal_movido = np.roll(canal_a_mover, dy, axis=0)
-            canal_movido = np.roll(canal_movido, dx, axis=1)
+    elif metodo in ['fourier', 'fase']:
+        # Aplicamos una ventana de Hanning para mitigar los artefactos en los bordes por la FFT
+        hanning_y = np.hanning(base_crop.shape[0])
+        hanning_x = np.hanning(base_crop.shape[1])
+        ventana = np.outer(hanning_y, hanning_x)
 
-            # Recortamos la imagen movida con los mismos márgenes
-            canal_movido_recortado = canal_movido[c_alto:-c_alto, c_ancho:-c_ancho]
+        base_w = base_crop * ventana
+        mover_w = mover_crop * ventana
 
-            # Calculamos el error (Suma de Diferencias al Cuadrado)
-            # Cuanto menor sea el número, más parecidas son las imágenes
-            diferencia = np.sum((np.float32(canal_base_recortado) - np.float32(canal_movido_recortado)) ** 2)
+        # Pasamos al dominio de Fourier
+        F_base = np.fft.fft2(base_w)
+        F_mover = np.fft.fft2(mover_w)
 
-            if diferencia < min_diferencia:
-                min_diferencia = diferencia
-                mejor_desplazamiento = (dx, dy)
+        # Correlación cruzada = F(base) * conjugado( F(mover) )
+        cross_power = F_base * np.conj(F_mover)
+
+        if metodo == 'fase':
+            # Correlación de fase: normalizamos por la magnitud
+            cross_power /= (np.abs(cross_power) + 1e-5)
+
+        # Volvemos al dominio espacial
+        correlacion = np.real(np.fft.ifft2(cross_power))
+        correlacion = np.fft.fftshift(correlacion) # Ponemos el (0,0) en el centro
+
+        # Buscamos el pico de correlación
+        H_c, W_c = correlacion.shape
+        y_max, x_max = np.unravel_index(np.argmax(correlacion), correlacion.shape)
+
+        dy = y_max - H_c // 2
+        dx = x_max - W_c // 2
+        mejor_desplazamiento = (dx, dy)
 
     return mejor_desplazamiento
 
@@ -114,14 +144,11 @@ def eliminar_defectos(imagen_color, umbral=30, area_maxima=4):
 
 
 def procesar_imagen_prokudin(ruta_imagen):
-    # 1. Leer la imagen original en escala de grises
     img = cv2.imread(ruta_imagen, cv2.IMREAD_GRAYSCALE)
     if img is None:
         print(f"Error al cargar la imagen: {ruta_imagen}")
         return None, None, None
 
-    # 2. Dividir la placa en tres partes iguales.
-    # El orden en las placas digitalizadas es, de arriba a abajo: azul, verde y rojo
     alto = img.shape[0]
     h_tercio = alto // 3
 
@@ -129,43 +156,67 @@ def procesar_imagen_prokudin(ruta_imagen):
     g = img[h_tercio:2 * h_tercio, :]
     r = img[2 * h_tercio:3 * h_tercio, :]
 
-    # 3. Puesta en correspondencia de los canales
-    # Usamos el canal Azul (B) como referencia fija y alineamos G y R hacia él.
-    print(f"Procesando {ruta_imagen}...")
+    print(f"\nProcesando {ruta_imagen}...")
+    print("-" * 50)
+    
+    # Benchmarking de los métodos
+    metodos = ['espacial', 'ncc', 'fourier', 'fase']
+    mejores_tiempos = {}
+    
+    print("Midiendo tiempos de alineación para el canal Verde (G):")
+    for m in metodos:
+        inicio = time.time()
+        dx, dy = alinear_canales_avanzado(g, b, metodo=m, margen_busqueda=15)
+        fin = time.time()
+        tiempo_total = fin - inicio
+        mejores_tiempos[m] = (tiempo_total, dx, dy)
+        print(f" - {m.capitalize():10s}: {tiempo_total:.4f} seg | Desplazamiento: (dx={dx:3d}, dy={dy:3d})")
 
-    dx_g, dy_g = alinear_canales(g, b)
+    # Escoger el método más rápido (excluyendo el 'espacial' puro si es muy errático)
+    # Por lo general, NCC o Fase darán los mejores resultados reales. Usaremos 'ncc' por defecto
+    # como punto de equilibrio perfecto entre velocidad y precisión.
+    metodo_elegido = 'ncc' 
+    print(f"\nUsando '{metodo_elegido}' para el alineado final...")
+
+    # Alineación G
+    tiempo_g, dx_g, dy_g = mejores_tiempos[metodo_elegido]
     g_alineado = np.roll(g, dy_g, axis=0)
     g_alineado = np.roll(g_alineado, dx_g, axis=1)
 
-    dx_r, dy_r = alinear_canales(r, b)
+    # Alineación R
+    dx_r, dy_r = alinear_canales_avanzado(r, b, metodo=metodo_elegido, margen_busqueda=15)
     r_alineado = np.roll(r, dy_r, axis=0)
     r_alineado = np.roll(r_alineado, dx_r, axis=1)
 
-    # 4. Aglutinar la solución en una imagen a color
-    # OpenCV utiliza el formato BGR por defecto para las imágenes a color
     imagen_color = cv2.merge([b, g_alineado, r_alineado])
 
-    # 5. Generar una segunda versión con corrección fotométrica
     b_corregido, g_corregido, r_corregido = aplicar_correcciones_fotometricas(b, g_alineado, r_alineado)
     imagen_color_corregida = cv2.merge([b_corregido, g_corregido, r_corregido])
 
-    # 6. Generar una tercera versión combinando corrección fotométrica y eliminación de defectos
     imagen_color_corregida_sin_defectos = eliminar_defectos(imagen_color_corregida)
 
     return imagen_color, imagen_color_corregida, imagen_color_corregida_sin_defectos
 
 
 if __name__ == "__main__":
-    ruta = 'laica-small.jpg'
+    # ruta = 'laica-big.jpg'
+    # ruta = 'san-nicolas-big.jpg'
+    ruta = 'soldier-big.jpg'
+    nombre_base = os.path.splitext(os.path.basename(ruta))[0]
+
+    salida_original = f'{nombre_base}_color.jpg'
+    salida_corregida = f'{nombre_base}_color_corregida.jpg'
+    salida_corregida_sin_defectos = f'{nombre_base}_color_corregida_sin_defectos.jpg'
+
     resultado_original, resultado_corregido, resultado_corregido_sin_defectos = procesar_imagen_prokudin(ruta)
 
     if resultado_original is not None and resultado_corregido is not None and resultado_corregido_sin_defectos is not None:
-        cv2.imwrite('laica_color.jpg', resultado_original)
-        print("Imagen original guardada como 'laica_color.jpg'.")
+        cv2.imwrite(salida_original, resultado_original)
+        print(f"Imagen original guardada como '{salida_original}'.")
 
-        cv2.imwrite('laica_color_corregida.jpg', resultado_corregido)
-        print("Imagen con corrección fotométrica guardada como 'laica_color_corregida.jpg'.")
+        cv2.imwrite(salida_corregida, resultado_corregido)
+        print(f"Imagen con corrección fotométrica guardada como '{salida_corregida}'.")
 
-        cv2.imwrite('laica_color_corregida_sin_defectos.jpg', resultado_corregido_sin_defectos)
+        cv2.imwrite(salida_corregida_sin_defectos, resultado_corregido_sin_defectos)
         print(
-            "Imagen con corrección fotométrica y eliminación de defectos guardada como 'laica_color_corregida_sin_defectos.jpg'.")
+            f"Imagen con corrección fotométrica y eliminación de defectos guardada como '{salida_corregida_sin_defectos}'.")
